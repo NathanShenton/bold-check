@@ -78,7 +78,8 @@ SYSTEM_PROMPT = (
     "   - If a category has an unbolded synonym in a component BUT that SAME component also has a bolded synonym for that category,\n"
     "     treat it as compliant (do NOT flag).\n"
     "4) Do not flag gluten-free phrases; do not treat sulphate/sulfate as sulphites.\n"
-    "5) If the product is clearly topical/cosmetic, set is_topical=true and return no allergens.\n"
+    "5a) If the product is clearly topical/cosmetic, set is_topical=true and return no allergens.\n"
+    "5b) If force_non_topical=true, you MUST set is_topical=false (these are oral supplements like gummies/tablets/capsules).\n"
     "6) Do NOT treat these phrases as the MILK allergen category: coconut milk, almond milk, oat milk, soy milk, milk thistle.\n\n"
     "Return only the structured JSON output."
 )
@@ -238,6 +239,11 @@ PLANT_MILK_RE = re.compile(
 )
 MILK_THISTLE_RE = re.compile(r"(?i)\bmilk\s+thistle\b")
 
+# If SKU name contains these, treat as NON-topical (e.g. Hair/Skin/Nails supplements)
+ORAL_DOSAGE_RE = re.compile(r"(?i)\b(gummies|gummy|tablets?|capsules?)\b")
+
+def force_non_topical_from_sku_name(sku_name: str) -> bool:
+    return bool(ORAL_DOSAGE_RE.search(clean_text(sku_name or "")))
 
 def is_non_dairy_milk_phrase(text: str, abs_start: int, abs_end: int) -> bool:
     """
@@ -595,11 +601,17 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
     if not evidence:
         return {"unbolded_allergens": [], "debug_matches": [], "is_topical": False}
 
+    sku_name_clean = clean_text(row.get("sku_name", "") or "")
+    force_non_topical = force_non_topical_from_sku_name(sku_name_clean)
+
     payload = {
         "sku": clean_text(row.get("sku", "") or ""),
-        "sku_name": clean_text(row.get("sku_name", "") or ""),
+        "sku_name": sku_name_clean,
         "ingredients_marked": clean_text(marked),
         "candidate_evidence": evidence,
+
+        # Optional: send this to the model so it doesn’t set is_topical=true
+        "force_non_topical": force_non_topical,
     }
     user_msg = json.dumps(payload, ensure_ascii=False)
 
@@ -621,7 +633,11 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
     model_cats = [c for c in data.get("unbolded_allergens", []) if c in ALLOWLIST]
     final_cats = [c for c in ALLOWLIST if c in model_cats and c in uncovered]
 
-    if data.get("is_topical", False):
+    # Python override: if SKU name indicates an oral supplement, never treat as topical
+    if force_non_topical:
+        data["is_topical"] = False
+
+    if data.get("is_topical", False) and not force_non_topical:
         final_cats = []
 
     data["unbolded_allergens"] = final_cats
