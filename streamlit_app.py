@@ -2,9 +2,9 @@ import csv
 import io
 import json
 import re
-import time
 import html as html_lib
-from typing import Dict, List, Tuple, Set, Any, Literal
+import unicodedata
+from typing import Dict, List, Tuple, Set, Any, Literal, Optional
 
 import streamlit as st
 from pydantic import BaseModel, Field
@@ -14,6 +14,19 @@ from pydantic import BaseModel, Field
 # ----------------------------
 DEFAULT_MODEL = "gpt-4.1-mini"
 TEMPERATURE = 0
+
+# Default expected output tokens per request (for cost estimate).
+# Your actual output is usually small, but set this a bit conservative.
+DEFAULT_EXPECTED_OUTPUT_TOKENS = 200
+
+# Pricing (USD) per 1M tokens for common models (standard, not fine-tuning).
+# Source: OpenAI docs pricing table. :contentReference[oaicite:0]{index=0}
+MODEL_PRICING_PER_1M = {
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1": {"input": 2.00, "output": 8.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    projected: Optional[str] = None  # (unused; placeholder to avoid accidental edits)
+}
 
 ALLOWLIST = [
     "celery",
@@ -70,6 +83,51 @@ SYSTEM_PROMPT = (
 )
 
 # ----------------------------
+# TEXT CLEANING (fix weird characters)
+# ----------------------------
+def clean_text(value: Any) -> str:
+    """
+    Cleans output so it doesn't contain odd UTF-8 artifacts, mojibake, control chars, etc.
+    - Uses ftfy if installed
+    - Normalises unicode (NFC)
+    - Removes control chars (except \n and \t)
+    """
+    if value is None:
+        return ""
+    s = str(value)
+
+    # Try to fix mojibake / broken encodings if ftfy exists
+    try:
+        import ftfy  # type: ignore
+        s = ftfy.fix_text(s)
+    except Exception:
+        pass
+
+    # Normalise unicode
+    s = unicodedata.normalize("NFC", s)
+
+    # Remove the replacement character and null bytes
+    s = s.replace("\uFFFD", "")
+    s = s.replace("\x00", "")
+
+    # Strip control chars except newline/tab
+    s = "".join(ch for ch in s if (ch in "\n\t") or (ord(ch) >= 32))
+
+    # Collapse excessive whitespace (optional but tends to make CSV nicer)
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s
+
+def clean_row_strings(d: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, str) or v is None or isinstance(v, (int, float, bool)):
+            out[k] = clean_text(v)
+        else:
+            # For lists/dicts/etc keep as-is (or stringify if you prefer)
+            out[k] = v
+    return out
+
+# ----------------------------
 # Candidate detection
 # ----------------------------
 def _word_regex(words: List[str]) -> re.Pattern:
@@ -99,14 +157,15 @@ SULPHATE_EXCLUSIONS = re.compile(r"(?i)(?<![A-Za-z0-9])(sulphate|sulphates|sulfa
 CANDIDATE_REGEX = _word_regex(CANDIDATE_TERMS)
 
 def is_candidate(ingredients: str) -> Tuple[bool, List[str]]:
+    ingredients = clean_text(ingredients)
     if not ingredients:
         return False, []
-    text = ingredients.strip()
-    matches = [m.group(1) for m in CANDIDATE_REGEX.finditer(text)]
+    matches = [m.group(1) for m in CANDIDATE_REGEX.finditer(ingredients)]
     if not matches:
         return False, []
     filtered = []
     for term in matches:
+        # term itself won't match sulphate regex (it is a single word), but keep logic anyway
         if SULPHATE_EXCLUSIONS.search(term):
             continue
         filtered.append(term)
@@ -120,6 +179,7 @@ BOLD_CLOSE = re.compile(r"(?i)<\s*/\s*(strong|b)\s*>")
 BLOCK_TAGS = re.compile(r"(?i)<\s*/?\s*(p|div|br|li|ul|ol|tr|td|th)\b[^>]*>")
 
 def html_to_marked_text(html: str) -> str:
+    html = clean_text(html)
     if not html:
         return ""
     s = html
@@ -131,7 +191,7 @@ def html_to_marked_text(html: str) -> str:
     s = s.replace("\r", "")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+    return clean_text(s)
 
 def iter_marked_segments(marked: str):
     i = 0
@@ -286,8 +346,10 @@ def compute_component_id_map(text: str) -> List[int]:
 def extract_candidate_evidence(marked: str) -> List[Dict[str, Any]]:
     segments = list(iter_marked_segments(marked))
     plain = "".join(seg for seg, _ in segments)
+
     comp_bounds = compute_component_bounds(plain)
     comp_id_map = compute_component_id_map(plain) if plain else []
+
     evidence: List[Dict[str, Any]] = []
     cursor = 0
 
@@ -324,8 +386,8 @@ def extract_candidate_evidence(marked: str) -> List[Dict[str, Any]]:
                     "is_bolded": is_bolded,
                     "is_precaution_like": is_precaution_like,
                     "component_id": component_id,
-                    "component_text": component_text,
-                    "context": context,
+                    "component_text": clean_text(component_text),
+                    "context": clean_text(context),
                 })
 
         cursor = seg_end
@@ -334,7 +396,14 @@ def extract_candidate_evidence(marked: str) -> List[Dict[str, Any]]:
     uniq: List[Dict[str, Any]] = []
     seen = set()
     for e in evidence:
-        key = (e["category"], e["term"].lower(), e["is_bolded"], e["is_precaution_like"], e["component_id"], e["context"])
+        key = (
+            e["category"],
+            str(e["term"]).lower(),
+            bool(e["is_bolded"]),
+            bool(e["is_precaution_like"]),
+            int(e["component_id"]),
+            e.get("context", ""),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -370,6 +439,46 @@ class AuditResult(BaseModel):
     is_topical: bool = False
 
 # ----------------------------
+# Token estimation
+# ----------------------------
+def estimate_tokens_for_text(model: str, text: str) -> int:
+    """
+    Best-effort token estimate.
+    - Uses tiktoken if available
+    - Falls back to rough heuristic (~4 chars/token)
+    """
+    text = text or ""
+    try:
+        import tiktoken  # type: ignore
+        try:
+            enc = tiktoken.encoding_for_model(model)
+        except Exception:
+            # good general fallbacks
+            try:
+                enc = tiktoken.get_encoding("o200k_base")
+            except Exception:
+                enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        # heuristic: ~4 chars/token (English-ish); ingredients can vary
+        return max(1, len(text) // 4)
+
+def estimate_request_tokens(model: str, system_prompt: str, user_json: str) -> int:
+    """
+    Minimal estimate for input tokens (system + user message).
+    """
+    return estimate_tokens_for_text(model, system_prompt) + estimate_tokens_for_text(model, user_json)
+
+def estimate_total_cost_usd(model: str, total_input_tokens: int, total_output_tokens: int) -> Optional[float]:
+    """
+    Uses MODEL_PRICING_PER_1M if we know the model.
+    """
+    pricing = MODEL_PRICING_PER_1M.get(model)
+    if not pricing:
+        return None
+    return (total_input_tokens / 1_000_000) * pricing["input"] + (total_output_tokens / 1_000_000) * pricing["output"]
+
+# ----------------------------
 # OpenAI call
 # ----------------------------
 def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
@@ -381,9 +490,9 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
         return {"unbolded_allergens": [], "debug_matches": [], "is_topical": False}
 
     payload = {
-        "sku": row.get("sku", "") or "",
-        "sku_name": row.get("sku_name", "") or "",
-        "ingredients_marked": marked,
+        "sku": clean_text(row.get("sku", "") or ""),
+        "sku_name": clean_text(row.get("sku_name", "") or ""),
+        "ingredients_marked": clean_text(marked),
         "candidate_evidence": evidence,
     }
     user_msg = json.dumps(payload, ensure_ascii=False)
@@ -410,13 +519,18 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
         final_cats = []
 
     data["unbolded_allergens"] = final_cats
+
+    # Clean any weird characters coming back
+    data["debug_matches"] = [clean_text(x) for x in (data.get("debug_matches") or [])]
     return data
 
 # ----------------------------
 # CSV helpers
 # ----------------------------
 def read_csv_upload(uploaded) -> Tuple[List[Dict[str, str]], List[str]]:
+    # decode with "replace" so the app never crashes on bad bytes
     raw = uploaded.getvalue().decode("utf-8-sig", errors="replace")
+    raw = clean_text(raw)
     f = io.StringIO(raw)
     reader = csv.DictReader(f)
     rows = list(reader)
@@ -428,8 +542,9 @@ def to_csv_bytes(rows: List[Dict[str, Any]], fieldnames: List[str]) -> bytes:
     w = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     w.writeheader()
     for r in rows:
-        w.writerow(r)
-    return buf.getvalue().encode("utf-8")
+        rr = clean_row_strings(r)
+        w.writerow(rr)
+    return buf.getvalue().encode("utf-8", errors="replace")
 
 # ----------------------------
 # Streamlit UI
@@ -439,101 +554,215 @@ st.title("Allergen Bold Audit (CSV → OpenAI)")
 
 st.markdown("**Input CSV must contain columns:** `sku`, `sku_name`, `ingredients`")
 
+# Session flags for the "estimate then OK" flow
+if "estimate_ready" not in st.session_state:
+    st.session_state.estimate_ready = False
+if "approved_to_run" not in st.session_state:
+    st.session_state.approved_to_run = False
+if "estimate_payload" not in st.session_state:
+    st.session_state.estimate_payload = None
+
 with st.sidebar:
     st.header("Settings")
     api_key = st.text_input("OpenAI API key", type="password", help="Used only for this session, not saved.")
     model = st.text_input("Model", value=DEFAULT_MODEL)
-    run_button = st.button("Run audit")
+    expected_out = st.number_input(
+        "Expected output tokens per SKU (estimate)",
+        min_value=10,
+        max_value=5000,
+        value=DEFAULT_EXPECTED_OUTPUT_TOKENS,
+        step=10,
+        help="Used only for the cost estimate. The model output is usually small JSON."
+    )
+
+    st.divider()
+    estimate_btn = st.button("1) Estimate cost")
+    run_btn = st.button("2) Run audit (after OK)")
 
 uploaded = st.file_uploader("Upload input CSV", type=["csv"])
 
-if uploaded and run_button:
-    if not api_key.strip():
-        st.error("Please enter your API key in the sidebar.")
-        st.stop()
+def normalize_headers(headers: List[str]) -> Dict[str, str]:
+    return {h.lower(): h for h in headers}
 
-    # Lazy import so app loads even if openai not installed yet
-    try:
-        from openai import OpenAI
-    except Exception:
-        st.error("Missing dependency: openai. Install with `pip install openai`.")
-        st.stop()
+def norm_row(r: Dict[str, str], header_map: Dict[str, str]) -> Dict[str, str]:
+    return {
+        "sku": clean_text(r.get(header_map.get("sku", ""), "")),
+        "sku_name": clean_text(r.get(header_map.get("sku_name", ""), "")),
+        "ingredients": clean_text(r.get(header_map.get("ingredients", ""), "")),
+    }
 
-    client = OpenAI(api_key=api_key.strip())
+def build_estimate(rows: List[Dict[str, str]], header_map: Dict[str, str], model: str, expected_out: int) -> Dict[str, Any]:
+    candidate_payloads: List[str] = []
+    non_candidate_count = 0
 
+    for raw_row in rows:
+        row = norm_row(raw_row, header_map)
+        cand, _hits = is_candidate(row.get("ingredients", ""))
+        if not cand:
+            non_candidate_count += 1
+            continue
+
+        # Build the same payload we’ll send later (for accurate token counting)
+        marked = html_to_marked_text(row.get("ingredients", "") or "")
+        evidence = extract_candidate_evidence(marked)
+
+        if not evidence:
+            # It was a candidate by rough regex but evidence extraction found nothing useful
+            non_candidate_count += 1
+            continue
+
+        payload = {
+            "sku": row.get("sku", "") or "",
+            "sku_name": row.get("sku_name", "") or "",
+            "ingredients_marked": marked,
+            "candidate_evidence": evidence,
+        }
+        candidate_payloads.append(json.dumps(payload, ensure_ascii=False))
+
+    # Estimate total input tokens = sum(system+user) across candidate calls
+    sys_tokens = estimate_tokens_for_text(model, SYSTEM_PROMPT)
+    total_input_tokens = 0
+    for user_json in candidate_payloads:
+        total_input_tokens += (sys_tokens + estimate_tokens_for_text(model, user_json))
+
+    total_calls = len(candidate_payloads)
+    total_output_tokens = total_calls * int(expected_out)
+
+    est_cost = estimate_total_cost_usd(model, total_input_tokens, total_output_tokens)
+
+    return {
+        "total_rows": len(rows),
+        "candidate_calls": total_calls,
+        "non_candidate_rows": non_candidate_count,
+        "estimated_input_tokens": total_input_tokens,
+        "estimated_output_tokens": total_output_tokens,
+        "estimated_cost_usd": est_cost,
+    }
+
+if uploaded:
     rows, headers = read_csv_upload(uploaded)
+    header_map = normalize_headers(headers)
     required = {"sku", "sku_name", "ingredients"}
-    if not required.issubset(set(h.lower() for h in headers)):
+    if not required.issubset(set(header_map.keys())):
         st.error(f"CSV headers found: {headers}\n\nRequired: sku, sku_name, ingredients")
         st.stop()
 
-    # Normalize column keys to expected names (case-insensitive)
-    # Build a mapping from lowercase -> actual
-    header_map = {h.lower(): h for h in headers}
-    def norm_row(r: Dict[str, str]) -> Dict[str, str]:
-        return {
-            "sku": r.get(header_map["sku"], ""),
-            "sku_name": r.get(header_map["sku_name"], ""),
-            "ingredients": r.get(header_map["ingredients"], ""),
-        }
+    # 1) Estimate button
+    if estimate_btn:
+        st.session_state.approved_to_run = False
+        st.session_state.estimate_ready = False
 
-    output_rows: List[Dict[str, Any]] = []
-    progress = st.progress(0)
-    status = st.empty()
+        est = build_estimate(rows, header_map, model, int(expected_out))
+        st.session_state.estimate_payload = est
+        st.session_state.estimate_ready = True
 
-    total = len(rows)
-    for i, raw_row in enumerate(rows, start=1):
-        row = norm_row(raw_row)
-        sku = (row.get("sku") or "").strip()
-        cand, hits = is_candidate(row.get("ingredients", ""))
+    # Show estimate panel if available
+    if st.session_state.estimate_ready and st.session_state.estimate_payload:
+        est = st.session_state.estimate_payload
 
-        out = {
-            "sku": row.get("sku", ""),
-            "sku_name": row.get("sku_name", ""),
-            "ingredients": row.get("ingredients", ""),
-            "candidate": "Y" if cand else "N",
-            "candidate_hits": ", ".join(hits),
-            "unbolded_allergens": "",
-            "debug_matches_json": "[]",
-            "is_topical": "N",
-            "status": "skipped_non_candidate",
-            "error": "",
-        }
+        st.subheader("Estimated cost (before running)")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rows in CSV", est["total_rows"])
+        c2.metric("OpenAI calls (candidates)", est["candidate_calls"])
+        c3.metric("Non-candidate rows (skipped)", est["non_candidate_rows"])
 
-        if cand:
-            status.text(f"[{i}/{total}] SKU={sku or '(blank)'} calling OpenAI…")
-            try:
-                result = openai_check(client, model, row)
-                cats = result.get("unbolded_allergens", []) or []
-                out["unbolded_allergens"] = ", ".join(cats)
-                out["debug_matches_json"] = json.dumps(result.get("debug_matches", []), ensure_ascii=False)
-                out["is_topical"] = "Y" if result.get("is_topical", False) else "N"
-                out["status"] = "ok"
-            except Exception as e:
-                out["status"] = "error"
-                out["error"] = str(e)
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Estimated input tokens", f'{est["estimated_input_tokens"]:,}')
+        c5.metric("Estimated output tokens", f'{est["estimated_output_tokens"]:,}')
+        if est["estimated_cost_usd"] is None:
+            c6.metric("Estimated cost (USD)", "Unknown model pricing")
+            st.info(
+                "I can’t price this model automatically. "
+                "Token estimates are shown; cost needs manual rates."
+            )
+        else:
+            c6.metric("Estimated cost (USD)", f'${est["estimated_cost_usd"]:.4f}')
 
-        output_rows.append(out)
-        progress.progress(i / total)
+        st.warning("If you’re happy with the estimate, click OK to unlock the run button.")
+        ok = st.button("OK — proceed to run")
+        if ok:
+            st.session_state.approved_to_run = True
 
-    status.text("Done.")
+    # 2) Run button (requires estimate + OK)
+    if run_btn:
+        if not api_key.strip():
+            st.error("Please enter your API key in the sidebar.")
+            st.stop()
+        if not st.session_state.estimate_ready:
+            st.error("Please click **Estimate cost** first.")
+            st.stop()
+        if not st.session_state.approved_to_run:
+            st.error("Please click **OK — proceed to run** after reviewing the estimate.")
+            st.stop()
 
-    fieldnames = [
-        "sku", "sku_name", "ingredients",
-        "candidate", "candidate_hits",
-        "unbolded_allergens", "debug_matches_json",
-        "is_topical",
-        "status", "error",
-    ]
+        # Lazy import so app loads even if openai not installed yet
+        try:
+            from openai import OpenAI
+        except Exception:
+            st.error("Missing dependency: openai. Install with `pip install openai`.")
+            st.stop()
 
-    st.success("Audit complete.")
-    st.dataframe(output_rows, use_container_width=True)
-    st.download_button(
-        "Download output CSV",
-        data=to_csv_bytes(output_rows, fieldnames),
-        file_name="output.csv",
-        mime="text/csv",
-    )
+        client = OpenAI(api_key=api_key.strip())
 
-elif uploaded and not run_button:
-    st.info("Upload looks good. Enter your API key in the sidebar, then click **Run audit**.")
+        output_rows: List[Dict[str, Any]] = []
+        progress = st.progress(0)
+        status = st.empty()
+        total = len(rows)
+
+        for i, raw_row in enumerate(rows, start=1):
+            row = norm_row(raw_row, header_map)
+            sku = (row.get("sku") or "").strip()
+            cand, hits = is_candidate(row.get("ingredients", ""))
+
+            out = {
+                "sku": row.get("sku", ""),
+                "sku_name": row.get("sku_name", ""),
+                "ingredients": row.get("ingredients", ""),
+                "candidate": "Y" if cand else "N",
+                "candidate_hits": ", ".join(hits),
+                "unbolded_allergens": "",
+                "debug_matches_json": "[]",
+                "is_topical": "N",
+                "status": "skipped_non_candidate",
+                "error": "",
+            }
+
+            if cand:
+                status.text(f"[{i}/{total}] SKU={sku or '(blank)'} calling OpenAI…")
+                try:
+                    result = openai_check(client, model, row)
+                    cats = result.get("unbolded_allergens", []) or []
+                    out["unbolded_allergens"] = ", ".join([clean_text(c) for c in cats])
+                    out["debug_matches_json"] = json.dumps(
+                        [clean_text(x) for x in (result.get("debug_matches", []) or [])],
+                        ensure_ascii=False
+                    )
+                    out["is_topical"] = "Y" if result.get("is_topical", False) else "N"
+                    out["status"] = "ok"
+                except Exception as e:
+                    out["status"] = "error"
+                    out["error"] = clean_text(str(e))
+
+            output_rows.append(clean_row_strings(out))
+            progress.progress(i / total)
+
+        status.text("Done.")
+
+        fieldnames = [
+            "sku", "sku_name", "ingredients",
+            "candidate", "candidate_hits",
+            "unbolded_allergens", "debug_matches_json",
+            "is_topical",
+            "status", "error",
+        ]
+
+        st.success("Audit complete.")
+        st.dataframe(output_rows, use_container_width=True)
+        st.download_button(
+            "Download output CSV",
+            data=to_csv_bytes(output_rows, fieldnames),
+            file_name="output.csv",
+            mime="text/csv",
+        )
+else:
+    st.info("Upload a CSV to begin.")
