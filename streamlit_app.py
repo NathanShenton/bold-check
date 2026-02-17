@@ -21,11 +21,12 @@ DEFAULT_EXPECTED_OUTPUT_TOKENS = 200
 
 # Pricing (USD) per 1M tokens for common models (standard, not fine-tuning).
 # Source: OpenAI docs pricing table. :contentReference[oaicite:0]{index=0}
+# Pricing (USD) per 1M tokens for common models (standard, not fine-tuning).
+# If a model isn't listed, we'll still estimate tokens but cost will show as "Unknown".
 MODEL_PRICING_PER_1M = {
     "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    projected: Optional[str] = None  # (unused; placeholder to avoid accidental edits)
 }
 
 ALLOWLIST = [
