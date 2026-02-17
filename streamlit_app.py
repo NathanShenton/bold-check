@@ -636,6 +636,8 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
     # Python override: if SKU name indicates an oral supplement, never treat as topical
     if force_non_topical:
         data["is_topical"] = False
+        data["debug_matches"] = (data.get("debug_matches") or []) + ["Topical override: SKU name indicates oral dosage form"]
+
 
     if data.get("is_topical", False) and not force_non_topical:
         final_cats = []
