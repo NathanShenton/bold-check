@@ -240,7 +240,13 @@ PLANT_MILK_RE = re.compile(
 MILK_THISTLE_RE = re.compile(r"(?i)\bmilk\s+thistle\b")
 
 # If SKU name contains these, treat as NON-topical (e.g. Hair/Skin/Nails supplements)
-ORAL_DOSAGE_RE = re.compile(r"(?i)\b(gummies|gummy|tablets?|capsules?)\b")
+ORAL_DOSAGE_RE = re.compile(
+    r"(?i)\b("
+    r"gummies|gummy|tablets?|capsules?|softgels?|caplets?|chewables?|lozenges?|pastilles?|"
+    r"gum|chewing\s+gum|mint|mints|"
+    r"powder|granules?|sachets?|drink|beverage|shot|shots|"
+    r")\b"
+)
 
 def force_non_topical_from_sku_name(sku_name: str) -> bool:
     return bool(ORAL_DOSAGE_RE.search(clean_text(sku_name or "")))
