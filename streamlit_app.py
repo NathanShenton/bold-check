@@ -16,13 +16,9 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 TEMPERATURE = 0
 
 # Default expected output tokens per request (for cost estimate).
-# Your actual output is usually small, but set this a bit conservative.
 DEFAULT_EXPECTED_OUTPUT_TOKENS = 200
 
 # Pricing (USD) per 1M tokens for common models (standard, not fine-tuning).
-# Source: OpenAI docs pricing table. :contentReference[oaicite:0]{index=0}
-# Pricing (USD) per 1M tokens for common models (standard, not fine-tuning).
-# If a model isn't listed, we'll still estimate tokens but cost will show as "Unknown".
 MODEL_PRICING_PER_1M = {
     "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
@@ -63,6 +59,9 @@ AllowedCategory = Literal[
     "sulphites",
 ]
 
+# ----------------------------
+# SYSTEM PROMPT (AI stage)
+# ----------------------------
 SYSTEM_PROMPT = (
     "You are a compliance auditor.\n"
     "You will be given JSON with:\n"
@@ -79,12 +78,13 @@ SYSTEM_PROMPT = (
     "   - If a category has an unbolded synonym in a component BUT that SAME component also has a bolded synonym for that category,\n"
     "     treat it as compliant (do NOT flag).\n"
     "4) Do not flag gluten-free phrases; do not treat sulphate/sulfate as sulphites.\n"
-    "5) If the product is clearly topical/cosmetic, set is_topical=true and return no allergens.\n\n"
+    "5) If the product is clearly topical/cosmetic, set is_topical=true and return no allergens.\n"
+    "6) Do NOT treat these phrases as the MILK allergen category: coconut milk, almond milk, oat milk, soy milk, milk thistle.\n\n"
     "Return only the structured JSON output."
 )
 
 # ----------------------------
-# TEXT CLEANING (fix weird characters)
+# TEXT CLEANING
 # ----------------------------
 def clean_text(value: Any) -> str:
     """
@@ -100,6 +100,7 @@ def clean_text(value: Any) -> str:
     # Try to fix mojibake / broken encodings if ftfy exists
     try:
         import ftfy  # type: ignore
+
         s = ftfy.fix_text(s)
     except Exception:
         pass
@@ -114,9 +115,10 @@ def clean_text(value: Any) -> str:
     # Strip control chars except newline/tab
     s = "".join(ch for ch in s if (ch in "\n\t") or (ord(ch) >= 32))
 
-    # Collapse excessive whitespace (optional but tends to make CSV nicer)
+    # Collapse excessive whitespace
     s = re.sub(r"[ \t]+", " ", s).strip()
     return s
+
 
 def clean_row_strings(d: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -124,53 +126,152 @@ def clean_row_strings(d: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(v, str) or v is None or isinstance(v, (int, float, bool)):
             out[k] = clean_text(v)
         else:
-            # For lists/dicts/etc keep as-is (or stringify if you prefer)
             out[k] = v
     return out
 
+
 # ----------------------------
-# Candidate detection
+# Candidate detection (cheap pre-filter)
 # ----------------------------
 def _word_regex(words: List[str]) -> re.Pattern:
     escaped = [re.escape(w) for w in words]
     pattern = r"(?i)(?<![A-Za-z0-9])(" + "|".join(escaped) + r")(?![A-Za-z0-9])"
     return re.compile(pattern)
 
+
 CANDIDATE_TERMS = [
     "celery",
-    "wheat", "rye", "barley", "oat", "oats",
-    "crustacean", "crustaceans", "shrimp", "prawn", "prawns", "crab", "lobster",
-    "mollusc", "molluscs", "mussel", "mussels", "oyster", "oysters", "squid", "octopus", "clam", "clams",
-    "egg", "eggs", "albumen",
-    "fish", "salmon", "tuna", "cod", "anchovy", "anchovies",
-    "lupin", "lupine",
-    "milk", "whey", "casein", "lactose", "cream", "cheese", "yoghurt", "yogurt",
+    "wheat",
+    "rye",
+    "barley",
+    "oat",
+    "oats",
+    "crustacean",
+    "crustaceans",
+    "shrimp",
+    "prawn",
+    "prawns",
+    "crab",
+    "lobster",
+    "mollusc",
+    "molluscs",
+    "mussel",
+    "mussels",
+    "oyster",
+    "oysters",
+    "squid",
+    "octopus",
+    "clam",
+    "clams",
+    "egg",
+    "eggs",
+    "albumen",
+    "fish",
+    "salmon",
+    "tuna",
+    "cod",
+    "anchovy",
+    "anchovies",
+    "lupin",
+    "lupine",
+    "milk",
+    "whey",
+    "casein",
+    "lactose",
+    "cream",
+    "cheese",
+    "yoghurt",
+    "yogurt",
     "mustard",
-    "almond", "almonds", "hazelnut", "hazelnuts", "walnut", "walnuts", "cashew", "cashews",
-    "pecan", "pecans", "brazil nut", "brazil nuts", "pistachio", "pistachios", "macadamia", "macadamias",
-    "peanut", "peanuts", "groundnut", "groundnuts",
+    "almond",
+    "almonds",
+    "hazelnut",
+    "hazelnuts",
+    "walnut",
+    "walnuts",
+    "cashew",
+    "cashews",
+    "pecan",
+    "pecans",
+    "brazil nut",
+    "brazil nuts",
+    "pistachio",
+    "pistachios",
+    "macadamia",
+    "macadamias",
+    "peanut",
+    "peanuts",
+    "groundnut",
+    "groundnuts",
     "sesame",
-    "soy", "soya", "soja",
-    "sulphite", "sulphites", "sulfite", "sulfites", "so2", "sulfur dioxide", "sulphur dioxide",
-    "e220", "e221", "e222", "e223", "e224", "e225", "e226", "e227", "e228",
+    "soy",
+    "soya",
+    "soja",
+    "sulphite",
+    "sulphites",
+    "sulfite",
+    "sulfites",
+    "so2",
+    "sulfur dioxide",
+    "sulphur dioxide",
+    "e220",
+    "e221",
+    "e222",
+    "e223",
+    "e224",
+    "e225",
+    "e226",
+    "e227",
+    "e228",
 ]
-SULPHATE_EXCLUSIONS = re.compile(r"(?i)(?<![A-Za-z0-9])(sulphate|sulphates|sulfate|sulfates)(?![A-Za-z0-9])")
+
+SULPHATE_EXCLUSIONS = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(sulphate|sulphates|sulfate|sulfates)(?![A-Za-z0-9])"
+)
 CANDIDATE_REGEX = _word_regex(CANDIDATE_TERMS)
+
+# --- NEW: "milk" false-positive exclusions (plant milks + botanical phrases)
+PLANT_MILK_RE = re.compile(
+    r"(?i)\b("
+    r"coconut|almond|oat|oats|soy|soya|rice|cashew|hazelnut|pea|hemp|macadamia|pistachio"
+    r")\s*[-]?\s+milk\b"
+)
+MILK_THISTLE_RE = re.compile(r"(?i)\bmilk\s+thistle\b")
+
+
+def is_non_dairy_milk_phrase(text: str, abs_start: int, abs_end: int) -> bool:
+    """
+    Returns True if a 'milk' match is part of a non-dairy phrase like 'coconut milk'
+    or a botanical phrase like 'milk thistle'.
+    """
+    window = text[max(0, abs_start - 30) : min(len(text), abs_end + 30)]
+    return bool(PLANT_MILK_RE.search(window) or MILK_THISTLE_RE.search(window))
+
 
 def is_candidate(ingredients: str) -> Tuple[bool, List[str]]:
     ingredients = clean_text(ingredients)
     if not ingredients:
         return False, []
-    matches = [m.group(1) for m in CANDIDATE_REGEX.finditer(ingredients)]
+
+    matches = [(m.group(1), m.start(1), m.end(1)) for m in CANDIDATE_REGEX.finditer(ingredients)]
     if not matches:
         return False, []
-    filtered = []
-    for term in matches:
-        # term itself won't match sulphate regex (it is a single word), but keep logic anyway
+
+    filtered: List[str] = []
+    for term, s, e in matches:
+        term_l = term.lower()
+
         if SULPHATE_EXCLUSIONS.search(term):
             continue
+
+        # --- NEW: stop "milk" from triggering candidate status when it is plant milk / milk thistle
+        if term_l == "milk" and is_non_dairy_milk_phrase(ingredients, s, e):
+            continue
+
         filtered.append(term)
+
     return (len(filtered) > 0), sorted(set(filtered), key=str.lower)
+
 
 # ----------------------------
 # HTML -> marked string [[B]]...[[/B]]
@@ -178,6 +279,7 @@ def is_candidate(ingredients: str) -> Tuple[bool, List[str]]:
 BOLD_OPEN = re.compile(r"(?i)<\s*(strong|b)\b[^>]*>")
 BOLD_CLOSE = re.compile(r"(?i)<\s*/\s*(strong|b)\s*>")
 BLOCK_TAGS = re.compile(r"(?i)<\s*/?\s*(p|div|br|li|ul|ol|tr|td|th)\b[^>]*>")
+
 
 def html_to_marked_text(html: str) -> str:
     html = clean_text(html)
@@ -193,6 +295,7 @@ def html_to_marked_text(html: str) -> str:
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return clean_text(s)
+
 
 def iter_marked_segments(marked: str):
     i = 0
@@ -218,8 +321,9 @@ def iter_marked_segments(marked: str):
     if buf:
         yield ("".join(buf), bold)
 
+
 # ----------------------------
-# Evidence extraction
+# Evidence extraction (precise scanning)
 # ----------------------------
 PRECAUTION_RE = re.compile(
     r"(?i)(may\s+contain|traces?\s+of|manufactured\s+in|made\s+in|facility\s+that\s+handles|factory\s+that\s+handles|site\s+that\s+handles)"
@@ -233,7 +337,6 @@ SYNONYM_TO_CATEGORY = {
     "barley": "cereals containing gluten",
     "oat": "cereals containing gluten",
     "oats": "cereals containing gluten",
-
     "milk": "milk",
     "milk powder": "milk",
     "skimmed milk": "milk",
@@ -245,11 +348,9 @@ SYNONYM_TO_CATEGORY = {
     "cheese": "milk",
     "yoghurt": "milk",
     "yogurt": "milk",
-
     "soy": "soy",
     "soya": "soy",
     "soja": "soy",
-
     "almond": "nuts",
     "almonds": "nuts",
     "hazelnut": "nuts",
@@ -266,30 +367,24 @@ SYNONYM_TO_CATEGORY = {
     "pistachios": "nuts",
     "macadamia": "nuts",
     "macadamias": "nuts",
-
     "peanut": "peanuts",
     "peanuts": "peanuts",
     "groundnut": "peanuts",
     "groundnuts": "peanuts",
-
     "egg": "eggs",
     "eggs": "eggs",
     "albumen": "eggs",
-
     "fish": "fish",
     "salmon": "fish",
     "tuna": "fish",
     "cod": "fish",
     "anchovy": "fish",
     "anchovies": "fish",
-
     "lupin": "lupin",
     "lupine": "lupin",
-
     "mustard": "mustard",
     "celery": "celery",
     "sesame": "sesame",
-
     "sulphite": "sulphites",
     "sulphites": "sulphites",
     "sulfite": "sulphites",
@@ -308,11 +403,14 @@ SYNONYM_TO_CATEGORY = {
     "e228": "sulphites",
 }
 
+
 def _compile_term(term: str) -> re.Pattern:
     esc = re.escape(term).replace(r"\ ", r"\s+")
     return re.compile(rf"(?i)(?<![A-Za-z0-9])({esc})(?![A-Za-z0-9])")
 
+
 TERM_PATTERNS = [(t, _compile_term(t)) for t in sorted(SYNONYM_TO_CATEGORY.keys(), key=len, reverse=True)]
+
 
 def compute_component_bounds(text: str) -> List[Tuple[int, int]]:
     bounds: List[Tuple[int, int]] = []
@@ -329,6 +427,7 @@ def compute_component_bounds(text: str) -> List[Tuple[int, int]]:
     bounds.append((start, len(text)))
     return bounds
 
+
 def compute_component_id_map(text: str) -> List[int]:
     ids = [0] * len(text)
     depth = 0
@@ -342,6 +441,7 @@ def compute_component_id_map(text: str) -> List[int]:
         elif depth == 0 and ch in [",", ";", "\n"]:
             comp += 1
     return ids
+
 
 def extract_candidate_evidence(marked: str) -> List[Dict[str, Any]]:
     segments = list(iter_marked_segments(marked))
@@ -366,29 +466,35 @@ def extract_candidate_evidence(marked: str) -> List[Dict[str, Any]]:
                 cat = SYNONYM_TO_CATEGORY[term]
                 is_bolded = bold_level > 0
 
-                window = plain[max(0, abs_start - 30):min(len(plain), abs_end + 30)]
+                # --- NEW: Exclude "milk" false positives such as "coconut milk" and "milk thistle"
+                if term == "milk" and is_non_dairy_milk_phrase(plain, abs_start, abs_end):
+                    continue
+
+                window = plain[max(0, abs_start - 30) : min(len(plain), abs_end + 30)]
                 if cat == "cereals containing gluten" and GLUTEN_FREE_RE.search(window):
                     continue
                 if cat == "sulphites" and SULPHATE_RE.search(window):
                     continue
 
-                clause = plain[max(0, abs_start - 80):min(len(plain), abs_end + 120)]
+                clause = plain[max(0, abs_start - 80) : min(len(plain), abs_end + 120)]
                 is_precaution_like = bool(PRECAUTION_RE.search(clause))
 
                 component_id = comp_id_map[abs_start] if comp_id_map and abs_start < len(comp_id_map) else 0
                 cb_start, cb_end = comp_bounds[component_id] if component_id < len(comp_bounds) else (0, len(plain))
                 component_text = plain[cb_start:cb_end].strip()
-                context = plain[max(0, abs_start - 50):min(len(plain), abs_end + 50)].strip()
+                context = plain[max(0, abs_start - 50) : min(len(plain), abs_end + 50)].strip()
 
-                evidence.append({
-                    "category": cat,
-                    "term": found,
-                    "is_bolded": is_bolded,
-                    "is_precaution_like": is_precaution_like,
-                    "component_id": component_id,
-                    "component_text": clean_text(component_text),
-                    "context": clean_text(context),
-                })
+                evidence.append(
+                    {
+                        "category": cat,
+                        "term": found,
+                        "is_bolded": is_bolded,
+                        "is_precaution_like": is_precaution_like,
+                        "component_id": component_id,
+                        "component_text": clean_text(component_text),
+                        "context": clean_text(context),
+                    }
+                )
 
         cursor = seg_end
 
@@ -408,7 +514,9 @@ def extract_candidate_evidence(marked: str) -> List[Dict[str, Any]]:
             continue
         seen.add(key)
         uniq.append(e)
+
     return uniq
+
 
 def uncovered_categories_from_evidence(evidence: List[Dict[str, Any]]) -> Set[str]:
     bold_comps: Dict[str, Set[int]] = {}
@@ -430,6 +538,7 @@ def uncovered_categories_from_evidence(evidence: List[Dict[str, Any]]) -> Set[st
             uncovered.add(cat)
     return uncovered
 
+
 # ----------------------------
 # Structured output model
 # ----------------------------
@@ -437,6 +546,7 @@ class AuditResult(BaseModel):
     unbolded_allergens: List[AllowedCategory] = Field(default_factory=list)
     debug_matches: List[str] = Field(default_factory=list)
     is_topical: bool = False
+
 
 # ----------------------------
 # Token estimation
@@ -450,33 +560,29 @@ def estimate_tokens_for_text(model: str, text: str) -> int:
     text = text or ""
     try:
         import tiktoken  # type: ignore
+
         try:
             enc = tiktoken.encoding_for_model(model)
         except Exception:
-            # good general fallbacks
             try:
                 enc = tiktoken.get_encoding("o200k_base")
             except Exception:
                 enc = tiktoken.get_encoding("cl100k_base")
         return len(enc.encode(text))
     except Exception:
-        # heuristic: ~4 chars/token (English-ish); ingredients can vary
         return max(1, len(text) // 4)
 
+
 def estimate_request_tokens(model: str, system_prompt: str, user_json: str) -> int:
-    """
-    Minimal estimate for input tokens (system + user message).
-    """
     return estimate_tokens_for_text(model, system_prompt) + estimate_tokens_for_text(model, user_json)
 
+
 def estimate_total_cost_usd(model: str, total_input_tokens: int, total_output_tokens: int) -> Optional[float]:
-    """
-    Uses MODEL_PRICING_PER_1M if we know the model.
-    """
     pricing = MODEL_PRICING_PER_1M.get(model)
     if not pricing:
         return None
     return (total_input_tokens / 1_000_000) * pricing["input"] + (total_output_tokens / 1_000_000) * pricing["output"]
+
 
 # ----------------------------
 # OpenAI call
@@ -510,7 +616,7 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
     parsed: AuditResult = resp.output_parsed
     data = parsed.model_dump()
 
-    # Post-filter safety
+    # Post-filter safety: only allow flagged categories that are actually uncovered per python evidence logic
     uncovered = uncovered_categories_from_evidence(evidence)
     model_cats = [c for c in data.get("unbolded_allergens", []) if c in ALLOWLIST]
     final_cats = [c for c in ALLOWLIST if c in model_cats and c in uncovered]
@@ -524,11 +630,11 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
     data["debug_matches"] = [clean_text(x) for x in (data.get("debug_matches") or [])]
     return data
 
+
 # ----------------------------
 # CSV helpers
 # ----------------------------
 def read_csv_upload(uploaded) -> Tuple[List[Dict[str, str]], List[str]]:
-    # decode with "replace" so the app never crashes on bad bytes
     raw = uploaded.getvalue().decode("utf-8-sig", errors="replace")
     raw = clean_text(raw)
     f = io.StringIO(raw)
@@ -536,6 +642,7 @@ def read_csv_upload(uploaded) -> Tuple[List[Dict[str, str]], List[str]]:
     rows = list(reader)
     headers = reader.fieldnames or []
     return rows, headers
+
 
 def to_csv_bytes(rows: List[Dict[str, Any]], fieldnames: List[str]) -> bytes:
     buf = io.StringIO()
@@ -545,6 +652,7 @@ def to_csv_bytes(rows: List[Dict[str, Any]], fieldnames: List[str]) -> bytes:
         rr = clean_row_strings(r)
         w.writerow(rr)
     return buf.getvalue().encode("utf-8", errors="replace")
+
 
 # ----------------------------
 # Streamlit UI
@@ -572,7 +680,7 @@ with st.sidebar:
         max_value=5000,
         value=DEFAULT_EXPECTED_OUTPUT_TOKENS,
         step=10,
-        help="Used only for the cost estimate. The model output is usually small JSON."
+        help="Used only for the cost estimate. The model output is usually small JSON.",
     )
 
     st.divider()
@@ -581,8 +689,10 @@ with st.sidebar:
 
 uploaded = st.file_uploader("Upload input CSV", type=["csv"])
 
+
 def normalize_headers(headers: List[str]) -> Dict[str, str]:
     return {h.lower(): h for h in headers}
+
 
 def norm_row(r: Dict[str, str], header_map: Dict[str, str]) -> Dict[str, str]:
     return {
@@ -590,6 +700,7 @@ def norm_row(r: Dict[str, str], header_map: Dict[str, str]) -> Dict[str, str]:
         "sku_name": clean_text(r.get(header_map.get("sku_name", ""), "")),
         "ingredients": clean_text(r.get(header_map.get("ingredients", ""), "")),
     }
+
 
 def build_estimate(rows: List[Dict[str, str]], header_map: Dict[str, str], model: str, expected_out: int) -> Dict[str, Any]:
     candidate_payloads: List[str] = []
@@ -607,7 +718,6 @@ def build_estimate(rows: List[Dict[str, str]], header_map: Dict[str, str], model
         evidence = extract_candidate_evidence(marked)
 
         if not evidence:
-            # It was a candidate by rough regex but evidence extraction found nothing useful
             non_candidate_count += 1
             continue
 
@@ -619,7 +729,6 @@ def build_estimate(rows: List[Dict[str, str]], header_map: Dict[str, str], model
         }
         candidate_payloads.append(json.dumps(payload, ensure_ascii=False))
 
-    # Estimate total input tokens = sum(system+user) across candidate calls
     sys_tokens = estimate_tokens_for_text(model, SYSTEM_PROMPT)
     total_input_tokens = 0
     for user_json in candidate_payloads:
@@ -638,6 +747,7 @@ def build_estimate(rows: List[Dict[str, str]], header_map: Dict[str, str], model
         "estimated_output_tokens": total_output_tokens,
         "estimated_cost_usd": est_cost,
     }
+
 
 if uploaded:
     rows, headers = read_csv_upload(uploaded)
@@ -671,10 +781,7 @@ if uploaded:
         c5.metric("Estimated output tokens", f'{est["estimated_output_tokens"]:,}')
         if est["estimated_cost_usd"] is None:
             c6.metric("Estimated cost (USD)", "Unknown model pricing")
-            st.info(
-                "I can’t price this model automatically. "
-                "Token estimates are shown; cost needs manual rates."
-            )
+            st.info("I can’t price this model automatically. Token estimates are shown; cost needs manual rates.")
         else:
             c6.metric("Estimated cost (USD)", f'${est["estimated_cost_usd"]:.4f}')
 
@@ -735,7 +842,7 @@ if uploaded:
                     out["unbolded_allergens"] = ", ".join([clean_text(c) for c in cats])
                     out["debug_matches_json"] = json.dumps(
                         [clean_text(x) for x in (result.get("debug_matches", []) or [])],
-                        ensure_ascii=False
+                        ensure_ascii=False,
                     )
                     out["is_topical"] = "Y" if result.get("is_topical", False) else "N"
                     out["status"] = "ok"
@@ -749,11 +856,16 @@ if uploaded:
         status.text("Done.")
 
         fieldnames = [
-            "sku", "sku_name", "ingredients",
-            "candidate", "candidate_hits",
-            "unbolded_allergens", "debug_matches_json",
+            "sku",
+            "sku_name",
+            "ingredients",
+            "candidate",
+            "candidate_hits",
+            "unbolded_allergens",
+            "debug_matches_json",
             "is_topical",
-            "status", "error",
+            "status",
+            "error",
         ]
 
         st.success("Audit complete.")
