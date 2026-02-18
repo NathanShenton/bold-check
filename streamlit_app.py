@@ -67,7 +67,9 @@ SYSTEM_PROMPT = (
     "You will be given JSON with:\n"
     "- sku, sku_name\n"
     "- ingredients_marked: a single string where bolded text is wrapped as [[B]]...[[/B]].\n"
-    "- candidate_evidence: a JSON list of ONLY the allergen synonyms that Python actually found.\n\n"
+    "- candidate_evidence: a JSON list of ONLY the allergen synonyms that Python actually found.\n"
+    "- force_non_topical: boolean.\n"
+    "- topical_hint: boolean.\n\n"
     "Your task: decide which of the 14 regulated allergen CATEGORIES are mentioned in a NON-precautionary way\n"
     "with an UNBOLDED mention that is NOT properly covered.\n\n"
     "Critical rules:\n"
@@ -78,7 +80,7 @@ SYSTEM_PROMPT = (
     "   - If a category has an unbolded synonym in a component BUT that SAME component also has a bolded synonym for that category,\n"
     "     treat it as compliant (do NOT flag).\n"
     "4) Do not flag gluten-free phrases; do not treat sulphate/sulfate as sulphites.\n"
-    "5a) If the product is clearly topical/cosmetic, set is_topical=true and return no allergens.\n"
+    "5a) If topical_hint=true and force_non_topical=false, set is_topical=true and return no allergens.\n"
     "5b) If force_non_topical=true, you MUST set is_topical=false (these are oral supplements like gummies/tablets/capsules).\n"
     "6) Do NOT treat these phrases as the MILK allergen category: coconut milk, almond milk, oat milk, soy milk, milk thistle.\n\n"
     "Return only the structured JSON output."
@@ -231,7 +233,7 @@ SULPHATE_EXCLUSIONS = re.compile(
 )
 CANDIDATE_REGEX = _word_regex(CANDIDATE_TERMS)
 
-# --- NEW: "milk" false-positive exclusions (plant milks + botanical phrases)
+# "milk" false-positive exclusions (plant milks + botanical phrases)
 PLANT_MILK_RE = re.compile(
     r"(?i)\b("
     r"coconut|almond|oat|oats|soy|soya|rice|cashew|hazelnut|pea|hemp|macadamia|pistachio"
@@ -239,7 +241,8 @@ PLANT_MILK_RE = re.compile(
 )
 MILK_THISTLE_RE = re.compile(r"(?i)\bmilk\s+thistle\b")
 
-# If SKU name contains these, treat as NON-topical (e.g. Hair/Skin/Nails supplements)
+
+# If SKU name contains these, treat as NON-topical (e.g. supplements)
 ORAL_DOSAGE_RE = re.compile(
     r"(?i)\b("
     r"gummies|gummy|tablets?|capsules?|softgels?|caplets?|chewables?|lozenges?|pastilles?|"
@@ -248,8 +251,48 @@ ORAL_DOSAGE_RE = re.compile(
     r")\b"
 )
 
+
 def force_non_topical_from_sku_name(sku_name: str) -> bool:
     return bool(ORAL_DOSAGE_RE.search(clean_text(sku_name or "")))
+
+
+# If SKU name contains these, treat as TOPICAL/cosmetic
+TOPICAL_RE = re.compile(
+    r"(?i)\b("
+    r"lotion|body\s+lotion|cream|hand\s+cream|face\s+cream|moisturis(er|er)|"
+    r"serum|eye\s+serum|eye\s+cream|"
+    r"balm|salve|ointment|unguent|rub|liniment|"
+    r"gel|spray|mist|foam|mousse|"
+    r"massage|cooling|warming|"
+    r"shampoo|conditioner|hair\s+mask|hair\s+oil|hair\s+serum|"
+    r"body\s+wash|shower\s+gel|soap|cleanser|face\s+wash|toner|micellar|"
+    r"scrub|exfoliat(or|ing)|mask|peel|"
+    r"deodorant|antiperspirant|"
+    r"suncream|sunscreen|spf|after\s*sun|"
+    r"makeup|cosmetic|lip\s+balm|lip\s+care|"
+    r"topical"
+    r")\b"
+)
+
+# Words that often indicate it's NOT topical even if it has ml
+NON_TOPICAL_CONTEXT_RE = re.compile(
+    r"(?i)\b("
+    r"drink|beverage|shot|syrup|elixir|tincture|oral|mouth|swallow|"
+    r"capsules?|tablets?|gummies|powder|granules|sachets?"
+    r")\b"
+)
+
+
+def is_topical_from_sku_name(sku_name: str) -> bool:
+    s = clean_text(sku_name or "")
+    if not s:
+        return False
+    if force_non_topical_from_sku_name(s):
+        return False
+    if NON_TOPICAL_CONTEXT_RE.search(s):
+        return False
+    return bool(TOPICAL_RE.search(s))
+
 
 def is_non_dairy_milk_phrase(text: str, abs_start: int, abs_end: int) -> bool:
     """
@@ -276,7 +319,7 @@ def is_candidate(ingredients: str) -> Tuple[bool, List[str]]:
         if SULPHATE_EXCLUSIONS.search(term):
             continue
 
-        # --- NEW: stop "milk" from triggering candidate status when it is plant milk / milk thistle
+        # Stop "milk" from triggering candidate status when it is plant milk / milk thistle
         if term_l == "milk" and is_non_dairy_milk_phrase(ingredients, s, e):
             continue
 
@@ -478,7 +521,7 @@ def extract_candidate_evidence(marked: str) -> List[Dict[str, Any]]:
                 cat = SYNONYM_TO_CATEGORY[term]
                 is_bolded = bold_level > 0
 
-                # --- NEW: Exclude "milk" false positives such as "coconut milk" and "milk thistle"
+                # Exclude "milk" false positives such as "coconut milk" and "milk thistle"
                 if term == "milk" and is_non_dairy_milk_phrase(plain, abs_start, abs_end):
                     continue
 
@@ -602,22 +645,32 @@ def estimate_total_cost_usd(model: str, total_input_tokens: int, total_output_to
 def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
     ingredients_html = row.get("ingredients", "") or ""
     marked = html_to_marked_text(ingredients_html)
-    evidence = extract_candidate_evidence(marked)
-
-    if not evidence:
-        return {"unbolded_allergens": [], "debug_matches": [], "is_topical": False}
 
     sku_name_clean = clean_text(row.get("sku_name", "") or "")
     force_non_topical = force_non_topical_from_sku_name(sku_name_clean)
+
+    # Cheap topical classifier from SKU name
+    topical_hint = is_topical_from_sku_name(sku_name_clean)
+
+    # If clearly topical and not forced non-topical, skip OpenAI entirely
+    if topical_hint and not force_non_topical:
+        return {
+            "unbolded_allergens": [],
+            "debug_matches": ["Topical override: SKU name indicates cosmetic/topical product"],
+            "is_topical": True,
+        }
+
+    evidence = extract_candidate_evidence(marked)
+    if not evidence:
+        return {"unbolded_allergens": [], "debug_matches": [], "is_topical": False}
 
     payload = {
         "sku": clean_text(row.get("sku", "") or ""),
         "sku_name": sku_name_clean,
         "ingredients_marked": clean_text(marked),
         "candidate_evidence": evidence,
-
-        # Optional: send this to the model so it doesn’t set is_topical=true
         "force_non_topical": force_non_topical,
+        "topical_hint": topical_hint,
     }
     user_msg = json.dumps(payload, ensure_ascii=False)
 
@@ -642,8 +695,9 @@ def openai_check(client, model: str, row: Dict[str, str]) -> Dict[str, Any]:
     # Python override: if SKU name indicates an oral supplement, never treat as topical
     if force_non_topical:
         data["is_topical"] = False
-        data["debug_matches"] = (data.get("debug_matches") or []) + ["Topical override: SKU name indicates oral dosage form"]
-
+        data["debug_matches"] = (data.get("debug_matches") or []) + [
+            "Topical override: SKU name indicates oral dosage form"
+        ]
 
     if data.get("is_topical", False) and not force_non_topical:
         final_cats = []
@@ -685,6 +739,29 @@ st.set_page_config(page_title="Allergen Bold Audit", layout="wide")
 st.title("Allergen Bold Audit (CSV → OpenAI)")
 
 st.markdown("**Input CSV must contain columns:** `sku`, `sku_name`, `ingredients`")
+
+with st.expander("What this app does (plain English)", expanded=False):
+    st.markdown(
+        """
+This tool checks whether allergens in your ingredient text are **bolded correctly**.
+
+**How it works:**
+- You upload a CSV with `sku`, `sku_name`, and `ingredients` (often HTML from the website/PIM).
+- The app converts the ingredients into plain text and marks anything that was bold as “bold”.
+- It looks for common allergen words (like milk, wheat, soy, nuts, etc.).
+- If it finds an allergen word that is **not bolded** (and it’s not in a “may contain” style warning), it flags that allergen category.
+- If the SKU name strongly suggests it’s a **topical/cosmetic** product (e.g., lotion, cream, serum), it marks it as topical and **doesn’t flag allergens**.
+
+**Why some rows are skipped:**
+- If no allergen words are found at all, the row is marked as “non-candidate” and no OpenAI call is made (saves cost).
+
+**Outputs:**
+- `candidate` / `candidate_hits`: whether it found possible allergen words.
+- `unbolded_allergens`: which allergen categories look unbolded (if any).
+- `is_topical`: whether it treated the product as topical/cosmetic.
+- `debug_matches_json`: short notes explaining overrides/decisions.
+        """
+    )
 
 # Session flags for the "estimate then OK" flow
 if "estimate_ready" not in st.session_state:
@@ -729,15 +806,26 @@ def norm_row(r: Dict[str, str], header_map: Dict[str, str]) -> Dict[str, str]:
 def build_estimate(rows: List[Dict[str, str]], header_map: Dict[str, str], model: str, expected_out: int) -> Dict[str, Any]:
     candidate_payloads: List[str] = []
     non_candidate_count = 0
+    topical_skipped = 0
+
+    sys_tokens = estimate_tokens_for_text(model, SYSTEM_PROMPT)
 
     for raw_row in rows:
         row = norm_row(raw_row, header_map)
+
+        # Skip obvious topical items (they won't call OpenAI in the run step either)
+        sku_name_clean = clean_text(row.get("sku_name", "") or "")
+        force_non_topical = force_non_topical_from_sku_name(sku_name_clean)
+        topical_hint = is_topical_from_sku_name(sku_name_clean)
+        if topical_hint and not force_non_topical:
+            topical_skipped += 1
+            continue
+
         cand, _hits = is_candidate(row.get("ingredients", ""))
         if not cand:
             non_candidate_count += 1
             continue
 
-        # Build the same payload we’ll send later (for accurate token counting)
         marked = html_to_marked_text(row.get("ingredients", "") or "")
         evidence = extract_candidate_evidence(marked)
 
@@ -747,26 +835,28 @@ def build_estimate(rows: List[Dict[str, str]], header_map: Dict[str, str], model
 
         payload = {
             "sku": row.get("sku", "") or "",
-            "sku_name": row.get("sku_name", "") or "",
+            "sku_name": sku_name_clean,
             "ingredients_marked": marked,
             "candidate_evidence": evidence,
+            "force_non_topical": force_non_topical,
+            "topical_hint": topical_hint,
         }
-        candidate_payloads.append(json.dumps(payload, ensure_ascii=False))
+        user_json = json.dumps(payload, ensure_ascii=False)
+        candidate_payloads.append(user_json)
 
-    sys_tokens = estimate_tokens_for_text(model, SYSTEM_PROMPT)
     total_input_tokens = 0
     for user_json in candidate_payloads:
         total_input_tokens += (sys_tokens + estimate_tokens_for_text(model, user_json))
 
     total_calls = len(candidate_payloads)
     total_output_tokens = total_calls * int(expected_out)
-
     est_cost = estimate_total_cost_usd(model, total_input_tokens, total_output_tokens)
 
     return {
         "total_rows": len(rows),
         "candidate_calls": total_calls,
         "non_candidate_rows": non_candidate_count,
+        "topical_rows_skipped": topical_skipped,
         "estimated_input_tokens": total_input_tokens,
         "estimated_output_tokens": total_output_tokens,
         "estimated_cost_usd": est_cost,
@@ -801,8 +891,8 @@ if uploaded:
         c3.metric("Non-candidate rows (skipped)", est["non_candidate_rows"])
 
         c4, c5, c6 = st.columns(3)
-        c4.metric("Estimated input tokens", f'{est["estimated_input_tokens"]:,}')
-        c5.metric("Estimated output tokens", f'{est["estimated_output_tokens"]:,}')
+        c4.metric("Topical rows (skipped)", est["topical_rows_skipped"])
+        c5.metric("Estimated input tokens", f'{est["estimated_input_tokens"]:,}')
         if est["estimated_cost_usd"] is None:
             c6.metric("Estimated cost (USD)", "Unknown model pricing")
             st.info("I can’t price this model automatically. Token estimates are shown; cost needs manual rates.")
@@ -843,6 +933,13 @@ if uploaded:
         for i, raw_row in enumerate(rows, start=1):
             row = norm_row(raw_row, header_map)
             sku = (row.get("sku") or "").strip()
+            sku_name_clean = clean_text(row.get("sku_name", "") or "")
+
+            # Determine topical/oral from SKU name first (for fast skip & consistent output)
+            force_non_topical = force_non_topical_from_sku_name(sku_name_clean)
+            topical_hint = is_topical_from_sku_name(sku_name_clean)
+
+            # Candidate scan (ingredients-based)
             cand, hits = is_candidate(row.get("ingredients", ""))
 
             out = {
@@ -857,6 +954,18 @@ if uploaded:
                 "status": "skipped_non_candidate",
                 "error": "",
             }
+
+            # Topical skip (unless oral override)
+            if topical_hint and not force_non_topical:
+                out["is_topical"] = "Y"
+                out["status"] = "skipped_topical"
+                out["debug_matches_json"] = json.dumps(
+                    ["Topical override: SKU name indicates cosmetic/topical product"],
+                    ensure_ascii=False,
+                )
+                output_rows.append(clean_row_strings(out))
+                progress.progress(i / total)
+                continue
 
             if cand:
                 status.text(f"[{i}/{total}] SKU={sku or '(blank)'} calling OpenAI…")
